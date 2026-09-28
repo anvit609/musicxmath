@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sync Party</title>
+<style>
+  :root { --bg:#0f0f14; --card:#1a1a24; --accent:#7c5cff; --text:#f0f0f5; --dim:#8a8a9a; }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; font-family: -apple-system, system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px;
+  }
+  .card { background: var(--card); border-radius:16px; padding:28px; width:100%; max-width:420px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  p.sub { color: var(--dim); margin:0 0 24px; font-size:14px; }
+  input, button {
+    width:100%; padding:14px; border-radius:10px; border:none; font-size:16px; margin-bottom:12px;
+  }
+  input { background:#26263a; color:var(--text); text-align:center; letter-spacing:2px; }
+  button { background: var(--accent); color:white; font-weight:600; cursor:pointer; }
+  button.secondary { background:#26263a; color:var(--text); }
+  button:active { opacity:0.8; }
+  .code-display { font-size:48px; text-align:center; letter-spacing:8px; font-weight:700; margin:20px 0; color:var(--accent); }
+  .status { text-align:center; color:var(--dim); font-size:13px; margin-top:8px; }
+  .row { display:flex; gap:10px; }
+  .row > * { flex:1; }
+  .hidden { display:none !important; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#4caf50; margin-right:6px; }
+  .dot.bad { background:#e53935; }
+  input[type=range] { padding:0; }
+  .label { font-size:12px; color:var(--dim); margin-bottom:6px; display:block; }
+  .result { display:flex; align-items:center; gap:10px; padding:8px; border-radius:8px; margin-bottom:6px; background:#22222f; }
+  .result img { width:40px; height:40px; border-radius:6px; object-fit:cover; flex-shrink:0; }
+  .result .meta { flex:1; min-width:0; }
+  .result .title { font-size:14px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .result .artist { font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .result button { width:auto; flex:0 0 64px; padding:8px; margin:0; font-size:13px; }
+  #searchResults { max-height:260px; overflow-y:auto; margin-bottom:12px; }
+  #searchResults:empty { margin-bottom:0; }
+  .searching { text-align:center; color:var(--dim); font-size:13px; padding:8px 0; }
+</style>
+</head>
+<body>
+
+<div class="card" id="landing">
+  <h1>🎵 Sync Party</h1>
+  <p class="sub">Turn every phone in the room into a synced speaker.</p>
+  <button id="createBtn">Create Room (Master)</button>
+  <div class="row">
+    <input id="joinCode" placeholder="ROOM CODE" maxlength="4" inputmode="numeric" />
+    <button class="secondary" id="joinBtn" style="width:auto;flex:0 0 100px;">Join</button>
+  </div>
+</div>
+
+<div class="card hidden" id="masterView">
+  <h1>You're the Master</h1>
+  <div class="code-display" id="roomCodeM">----</div>
+  <p class="status" id="peerCountM">0 listeners connected</p>
+  <button id="liveBtn">🎧 Share device audio (any app / tab)</button>
+  <p class="status" id="liveStatus" style="margin:-4px 0 14px;">Desktop Chrome/Edge only. Tick "Share audio" in the popup.</p>
+
+  <label class="label">Search Audius</label>
+  <div class="row">
+    <input id="searchInput" placeholder="Search songs or artists" style="text-align:left;letter-spacing:normal;" />
+    <button class="secondary" id="searchBtn" style="width:auto;flex:0 0 90px;">Search</button>
+  </div>
+  <div id="searchResults"></div>
+
+  <label class="label">Or paste a direct audio URL</label>
+  <input id="trackUrl" placeholder="https://...song.mp3" style="text-align:left;letter-spacing:normal;" />
+  <button id="loadBtn">Load &amp; Play</button>
+  <div class="row">
+    <button class="secondary" id="playPauseBtn">Pause</button>
+  </div>
+  <label class="label">Seek</label>
+  <input type="range" id="seekBar" min="0" max="100" value="0" />
+  <audio id="audioM" style="display:none;"></audio>
+</div>
+
+<div class="card hidden" id="listenerView">
+  <h1>🔊 Listening</h1>
+  <p class="status"><span class="dot" id="syncDot"></span><span id="syncStatus">Syncing clock…</span></p>
+  <p class="status" id="peerCountL"></p>
+  <label class="label">Volume</label>
+  <input type="range" id="volume" min="0" max="1" step="0.01" value="1" />
+  <p class="status" id="liveListenStatus"></p>
+  <button id="tapToListen" class="hidden">🔊 Tap to hear live audio</button>
+  <audio id="audioL" style="display:none;"></audio>
+  <audio id="liveL" autoplay playsinline style="display:none;"></audio>
+</div>
+
+<script>
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+// Allow the frontend to be hosted separately (e.g. on Netlify) from the
+// WebSocket server (e.g. on Render/Railway/Fly.io/Glitch) via ?server=host
+const params = new URLSearchParams(location.search);
+const serverHost = params.get('server') || location.host;
+const ws = new WebSocket(`${proto}://${serverHost}`);
+
+let clockOffset = 0; // serverTime - localTime
+let isMaster = false;
+let audioEl = null;
+
+const landing = document.getElementById('landing');
+const masterView = document.getElementById('masterView');
+const listenerView = document.getElementById('listenerView');
+
+// ---------- Clock sync (NTP-style) ----------
+function syncClock(samples = 5) {
+  let best = null;
+  let count = 0;
+  function pingOnce() {
+    const t0 = Date.now();
+    const handler = (e) => {
+      const msg = JSON.parse(e.data);
+      if (msg.type !== 'pong') return;
+      const t1 = Date.now();
+      const rtt = t1 - t0;
+      const offset = msg.serverTime - (t0 + t1) / 2;
+      if (best === null || rtt < best.rtt) best = { rtt, offset };
+      ws.removeEventListener('message', handler);
+      count++;
+      if (count < samples) {
+        setTimeout(pingOnce, 150);
+      } else {
+        clockOffset = best.offset;
+        document.getElementById('syncStatus') && (document.getElementById('syncStatus').textContent = 'Synced');
+        document.getElementById('syncDot') && document.getElementById('syncDot').classList.remove('bad');
+      }
+    };
+    ws.addEventListener('message', handler);
+    ws.send(JSON.stringify({ type: 'ping', t0 }));
+  }
+  pingOnce();
+}
+
+function serverNow() { return Date.now() + clockOffset; }
+function localTimeFor(targetServerTime) { return targetServerTime - clockOffset; }
+
+// re-sync the clock periodically — phone clocks drift over a long listening session
+setInterval(() => { if (ws.readyState === 1) syncClock(3); }, 20000);
+
+// ---------- Continuous drift correction (listener only) ----------
+// driftRef is updated whenever a 'timeupdate' heartbeat arrives from the master.
+// This loop runs independently every 200ms so correction isn't limited by heartbeat frequency.
+let driftRef = null; // { position, atLocalTime }
+setInterval(() => {
+  if (isMaster || !driftRef || !audioEl) return;
+  if (audioEl.paused || audioEl.readyState < 2) return;
+
+  const elapsed = (Date.now() - driftRef.atLocalTime) / 1000;
+  const expected = driftRef.position + elapsed;
+  const drift = expected - audioEl.currentTime; // positive = listener is behind
+
+  const dot = document.getElementById('syncDot');
+  const label = document.getElementById('syncStatus');
+
+  if (Math.abs(drift) > 0.15) {
+    // too far off to fix smoothly — snap to the correct spot
+    audioEl.currentTime = expected;
+    audioEl.playbackRate = 1;
+    if (dot) dot.classList.add('bad');
+  } else {
+    if (dot) dot.classList.remove('bad');
+    // gently nudge speed to close small gaps without an audible jump/pitch glitch
+    if (Math.abs(drift) < 0.02) audioEl.playbackRate = 1;
+    else audioEl.playbackRate = drift > 0 ? 1.04 : 0.96;
+  }
+  if (label) label.textContent = `Synced (drift ${Math.round(drift * 1000)}ms)`;
+}, 200);
+
+// ---------- Landing actions ----------
+document.getElementById('createBtn').onclick = () => {
+  ws.send(JSON.stringify({ type: 'create' }));
+};
+document.getElementById('joinBtn').onclick = () => {
+  const code = document.getElementById('joinCode').value.trim();
+  if (!code) return;
+  // unlock audio on this user gesture
+  audioEl = document.getElementById('audioL');
+  audioEl.play().then(() => audioEl.pause()).catch(() => {});
+  ws.send(JSON.stringify({ type: 'join', code }));
+};
+
+// ---------- Audius search ----------
+const AUDIUS_API = 'https://api.audius.co/v1';
+const APP_NAME = 'SyncParty';
+
+function loadTrack(url) {
+  ws.send(JSON.stringify({ type: 'control', action: 'load', url, position: 0 }));
+  document.getElementById('trackUrl').value = url;
+}
+
+async function runSearch() {
+  const query = document.getElementById('searchInput').value.trim();
+  const results = document.getElementById('searchResults');
+  if (!query) return;
+  results.innerHTML = '<div class="searching">Searching…</div>';
+  try {
+    const res = await fetch(`${AUDIUS_API}/tracks/search?query=${encodeURIComponent(query)}&app_name=${APP_NAME}`);
+    const json = await res.json();
+    const tracks = (json.data || []).slice(0, 8);
+    if (!tracks.length) {
+      results.innerHTML = '<div class="searching">No results</div>';
+      return;
+    }
+    results.innerHTML = '';
+    tracks.forEach((t) => {
+      const artwork = t.artwork && (t.artwork['150x150'] || t.artwork['480x480']) || '';
+      const streamUrl = `${AUDIUS_API}/tracks/${t.id}/stream?app_name=${APP_NAME}`;
+      const row = document.createElement('div');
+      row.className = 'result';
+      row.innerHTML = `
+        ${artwork ? `<img src="${artwork}" />` : '<div style="width:40px;height:40px;border-radius:6px;background:#333;flex-shrink:0;"></div>'}
+        <div class="meta">
+          <div class="title">${t.title}</div>
+          <div class="artist">${t.user ? t.user.name : ''}</div>
+        </div>
+        <button>Play</button>
+      `;
+      row.querySelector('button').onclick = () => loadTrack(streamUrl);
+      results.appendChild(row);
+    });
+  } catch (err) {
+    results.innerHTML = '<div class="searching">Search failed — check connection</div>';
+  }
+}
+
+document.getElementById('searchBtn').onclick = runSearch;
+document.getElementById('searchInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') runSearch();
+});
+
+// ---------- Master controls ----------
+document.getElementById('loadBtn').onclick = () => {
+  const url = document.getElementById('trackUrl').value.trim();
+  if (!url) return;
+  ws.send(JSON.stringify({ type: 'control', action: 'load', url, position: 0 }));
+};
+document.getElementById('playPauseBtn').onclick = () => {
+  const btn = document.getElementById('playPauseBtn');
+  const audio = document.getElementById('audioM');
+  if (audio.paused) {
+    ws.send(JSON.stringify({ type: 'control', action: 'play', url: audio.src, position: audio.currentTime }));
+    btn.textContent = 'Pause';
+  } else {
+    ws.send(JSON.stringify({ type: 'control', action: 'pause', position: audio.currentTime }));
+    btn.textContent = 'Play';
+  }
+};
+document.getElementById('seekBar').oninput = (e) => {
+  const audio = document.getElementById('audioM');
+  const pos = (e.target.value / 100) * (audio.duration || 0);
+  ws.send(JSON.stringify({ type: 'control', action: 'seek', url: audio.src, position: pos }));
+};
+
+// master reports its position periodically for drift correction
+let timeupdateTimer = null;
+function startMasterHeartbeat() {
+  const audio = document.getElementById('audioM');
+  if (timeupdateTimer) clearInterval(timeupdateTimer);
+  timeupdateTimer = setInterval(() => {
+    if (!audio.paused) {
+      ws.send(JSON.stringify({ type: 'control', action: 'timeupdate', position: audio.currentTime }));
+    }
+  }, 1000); // frequent heartbeat so listeners' reference point stays fresh
+}
+
+// ---------- Volume (local only) ----------
+document.getElementById('volume').oninput = (e) => {
+  if (audioEl) audioEl.volume = parseFloat(e.target.value);
+};
+
+// ---------- Scheduling helper ----------
+function scheduleAt(targetServerTime, fn) {
+  const delay = Math.max(0, localTimeFor(targetServerTime) - Date.now());
+  setTimeout(fn, delay);
+}
+
+
+// ---------- Live device-audio streaming (WebRTC) ----------
+// Master captures whatever audio the browser can grab (a tab, or whole-system audio on
+// Windows/ChromeOS) and sends it to every listener over a peer-to-peer WebRTC connection.
+const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+let liveStream = null;
+let livePeers = new Map();      // master side: listenerId -> RTCPeerConnection
+let knownListeners = new Set(); // master side: everyone currently in the room
+let listenerPc = null;          // listener side: connection to master
+
+function tuneOpus(sdp) {
+  // stereo + higher bitrate so music doesn't sound like a phone call
+  return sdp.replace('useinbandfec=1', 'useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=192000');
+}
+
+function sendSignal(to, data) {
+  ws.send(JSON.stringify({ type: 'signal', to, data }));
+}
+
+async function connectListener(id) {
+  if (!liveStream || livePeers.has(id)) return;
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  livePeers.set(id, pc);
+  liveStream.getAudioTracks().forEach((t) => pc.addTrack(t, liveStream));
+  pc.onicecandidate = (e) => { if (e.candidate) sendSignal(id, { candidate: e.candidate }); };
+  pc.onconnectionstatechange = () => {
+    if (['failed', 'closed'].includes(pc.connectionState)) { pc.close(); livePeers.delete(id); }
+  };
+  const offer = await pc.createOffer();
+  offer.sdp = tuneOpus(offer.sdp);
+  await pc.setLocalDescription(offer);
+  sendSignal(id, { sdp: pc.localDescription });
+}
+
+async function startLive() {
+  const status = document.getElementById('liveStatus');
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    status.textContent = "This browser can't capture audio. Use Chrome/Edge on a laptop or PC.";
+    return;
+  }
+  try {
+    liveStream = await navigator.mediaDevices.getDisplayMedia({
+      video: true, // browsers require video to be requested; we only send the audio track
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+  } catch (err) {
+    status.textContent = 'Sharing cancelled.';
+    return;
+  }
+  if (!liveStream.getAudioTracks().length) {
+    liveStream.getTracks().forEach((t) => t.stop());
+    liveStream = null;
+    status.textContent = 'No audio was shared. Choose a tab/screen and tick "Share audio".';
+    return;
+  }
+  // stop the Audius player so only one thing plays
+  const audioM = document.getElementById('audioM');
+  if (!audioM.paused) ws.send(JSON.stringify({ type: 'control', action: 'pause', position: audioM.currentTime }));
+
+  liveStream.getAudioTracks()[0].addEventListener('ended', stopLive); // user hit "Stop sharing"
+  ws.send(JSON.stringify({ type: 'live', on: true }));
+  knownListeners.forEach((id) => connectListener(id));
+  document.getElementById('liveBtn').textContent = '⏹ Stop sharing device audio';
+  status.textContent = 'Live: everything playing in the shared tab/screen is going to listeners.';
+}
+
+function stopLive() {
+  if (liveStream) liveStream.getTracks().forEach((t) => t.stop());
+  liveStream = null;
+  livePeers.forEach((pc) => pc.close());
+  livePeers.clear();
+  ws.send(JSON.stringify({ type: 'live', on: false }));
+  document.getElementById('liveBtn').textContent = '🎧 Share device audio (any app / tab)';
+  document.getElementById('liveStatus').textContent = 'Stopped.';
+}
+
+document.getElementById('liveBtn').onclick = () => (liveStream ? stopLive() : startLive());
+
+// listener side: answer the master's offer and play the incoming stream
+async function handleSignal(from, data) {
+  if (isMaster) {
+    const pc = livePeers.get(from);
+    if (!pc) return;
+    if (data.sdp) await pc.setRemoteDescription(data.sdp);
+    if (data.candidate) await pc.addIceCandidate(data.candidate).catch(() => {});
+    return;
+  }
+  if (!listenerPc) {
+    listenerPc = new RTCPeerConnection(RTC_CONFIG);
+    listenerPc.onicecandidate = (e) => { if (e.candidate) sendSignal(from, { candidate: e.candidate }); };
+    listenerPc.ontrack = (e) => {
+      // same playout buffer on every phone keeps them closer together
+      try { e.receiver.jitterBufferTarget = 250; } catch (_) {}
+      const el = document.getElementById('liveL');
+      el.srcObject = e.streams[0];
+      document.getElementById('audioL').pause(); // silence any Audius track
+      el.play().then(
+        () => { document.getElementById('tapToListen').classList.add('hidden'); },
+        () => { document.getElementById('tapToListen').classList.remove('hidden'); }
+      );
+      document.getElementById('liveListenStatus').textContent = '🔴 Live audio from master';
+    };
+  }
+  if (data.sdp) {
+    await listenerPc.setRemoteDescription(data.sdp);
+    const answer = await listenerPc.createAnswer();
+    answer.sdp = tuneOpus(answer.sdp);
+    await listenerPc.setLocalDescription(answer);
+    sendSignal(from, { sdp: listenerPc.localDescription });
+  }
+  if (data.candidate) await listenerPc.addIceCandidate(data.candidate).catch(() => {});
+}
+
+document.getElementById('tapToListen').onclick = () => {
+  document.getElementById('liveL').play().then(() =>
+    document.getElementById('tapToListen').classList.add('hidden')).catch(() => {});
+};
+
+function endLiveOnListener() {
+  if (listenerPc) { listenerPc.close(); listenerPc = null; }
+  const el = document.getElementById('liveL');
+  el.srcObject = null;
+  document.getElementById('liveListenStatus').textContent = '';
+  document.getElementById('tapToListen').classList.add('hidden');
+}
+
+// ---------- Incoming messages ----------
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+
+  switch (msg.type) {
+    case 'created': {
+      isMaster = true;
+      landing.classList.add('hidden');
+      masterView.classList.remove('hidden');
+      document.getElementById('roomCodeM').textContent = msg.code;
+      audioEl = document.getElementById('audioM');
+      syncClock();
+      startMasterHeartbeat();
+      audioEl.addEventListener('timeupdate', () => {
+        if (audioEl.duration) {
+          document.getElementById('seekBar').value = (audioEl.currentTime / audioEl.duration) * 100;
+        }
+      });
+      break;
+    }
+
+    case 'joined': {
+      landing.classList.add('hidden');
+      listenerView.classList.remove('hidden');
+      syncClock();
+      break;
+    }
+
+    case 'error': {
+      alert(msg.message);
+      break;
+    }
+
+    case 'peers': {
+      const text = `${msg.count} device${msg.count === 1 ? '' : 's'} connected`;
+      const m = document.getElementById('peerCountM');
+      const l = document.getElementById('peerCountL');
+      if (m) m.textContent = text;
+      if (l) l.textContent = text;
+      break;
+    }
+
+    case 'peerJoined': {
+      knownListeners.add(msg.id);
+      if (liveStream) connectListener(msg.id); // someone joined mid-stream
+      break;
+    }
+
+    case 'peerLeft': {
+      knownListeners.delete(msg.id);
+      const pc = livePeers.get(msg.id);
+      if (pc) { pc.close(); livePeers.delete(msg.id); }
+      break;
+    }
+
+    case 'signal': {
+      handleSignal(msg.from, msg.data);
+      break;
+    }
+
+    case 'live': {
+      if (!msg.on) endLiveOnListener();
+      break;
+    }
+
+    case 'masterLeft': {
+      alert('Master left — room closed.');
+      location.reload();
+      break;
+    }
+
+    case 'control': {
+      const audio = isMaster ? document.getElementById('audioM') : document.getElementById('audioL');
+      if (!audio) break;
+
+      if (msg.action === 'load') {
+        audio.src = msg.url;
+        audio.load();
+        const startPlaying = () => {
+          audio.currentTime = msg.position || 0;
+          scheduleAt(msg.targetServerTime, () => audio.play().catch(() => {}));
+        };
+        audio.addEventListener('canplaythrough', startPlaying, { once: true });
+      }
+
+      if (msg.action === 'play') {
+        audio.currentTime = msg.position || 0;
+        scheduleAt(msg.targetServerTime, () => audio.play().catch(() => {}));
+      }
+
+      if (msg.action === 'pause') {
+        scheduleAt(msg.targetServerTime, () => audio.pause());
+      }
+
+      if (msg.action === 'seek') {
+        scheduleAt(msg.targetServerTime, () => { audio.currentTime = msg.position; });
+      }
+
+      if (msg.action === 'timeupdate' && !isMaster) {
+        // store a fresh reference point; the correction loop below runs continuously
+        // between heartbeats so drift is caught within ~200ms, not every 1-3s
+        driftRef = { position: msg.position, atLocalTime: localTimeFor(msg.serverTime) };
+      }
+      break;
+    }
+  }
+};
+</script>
+</body>
+</html>
