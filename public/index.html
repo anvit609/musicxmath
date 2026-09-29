@@ -294,6 +294,16 @@ function tuneOpus(sdp) {
   return sdp.replace('useinbandfec=1', 'useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=192000');
 }
 
+// Every listener targets this same buffering amount (seconds) so they all lag the
+// master by roughly the same margin instead of each drifting independently. Setting
+// it once, immediately when the receiver appears, matters — changing it later can take
+// the browser ~30s to fully re-converge, so we deliberately never adjust it again mid-call.
+const LIVE_SYNC_DELAY_SEC = 1.0;
+function applyCommonPlayoutDelay(receiver) {
+  try { if ('playoutDelayHint' in receiver) receiver.playoutDelayHint = LIVE_SYNC_DELAY_SEC; } catch (_) {}
+  try { if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = LIVE_SYNC_DELAY_SEC * 1000; } catch (_) {}
+}
+
 function sendSignal(to, data) {
   ws.send(JSON.stringify({ type: 'signal', to, data }));
 }
@@ -370,8 +380,12 @@ async function handleSignal(from, data) {
     listenerPc = new RTCPeerConnection(RTC_CONFIG);
     listenerPc.onicecandidate = (e) => { if (e.candidate) sendSignal(from, { candidate: e.candidate }); };
     listenerPc.ontrack = (e) => {
-      // same playout buffer on every phone keeps them closer together
-      try { e.receiver.jitterBufferTarget = 250; } catch (_) {}
+      // Force every listener to buffer the SAME amount before playing, rather than each
+      // phone picking its own delay based on its own network conditions (which is what
+      // was causing devices to drift apart from each other). A bigger shared buffer =
+      // more lag behind the master, but much tighter agreement between listeners, which
+      // is what actually matters for a room full of "speakers".
+      applyCommonPlayoutDelay(e.receiver);
       const el = document.getElementById('liveL');
       el.srcObject = e.streams[0];
       document.getElementById('audioL').pause(); // silence any Audius track
@@ -379,7 +393,7 @@ async function handleSignal(from, data) {
         () => { document.getElementById('tapToListen').classList.add('hidden'); },
         () => { document.getElementById('tapToListen').classList.remove('hidden'); }
       );
-      document.getElementById('liveListenStatus').textContent = '🔴 Live audio from master';
+      document.getElementById('liveListenStatus').textContent = '🔴 Live audio from master (~1s behind, synced)';
     };
   }
   if (data.sdp) {
@@ -515,3 +529,4 @@ ws.onmessage = (e) => {
 </script>
 </body>
 </html>
+
